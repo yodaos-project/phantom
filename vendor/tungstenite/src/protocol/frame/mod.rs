@@ -253,17 +253,21 @@ impl FrameCodec {
         if len <= FRAGMENT {
             return Ok(false);
         }
-        // Each masked fragment has at most eight header bytes. If the extra headers
-        // would exceed the write budget, use the original, already-admitted frame.
-        let headers = len.div_ceil(FRAGMENT) * 8;
-        if !self.can_buffer(len.saturating_add(headers)) {
+        // The last fragment may use the short payload-length encoding. Count each
+        // wire header with its pending four-byte client mask before advancing the queue.
+        let full_fragments = (len - 1) / FRAGMENT;
+        let last_len = len - full_fragments * FRAGMENT;
+        let masked_header_len = |size: usize| frame.header().len(size as u64) + 4;
+        let headers = full_fragments * masked_header_len(FRAGMENT) + masked_header_len(last_len);
+        let wire_len = len + headers;
+        if !self.can_buffer(wire_len) {
             return Ok(false);
         }
 
         let start = self.out_buffer.len();
         let mut remaining = frame.clone().into_payload();
         let mut header = frame.header().clone();
-        self.out_buffer.reserve(len + headers);
+        self.out_buffer.reserve(wire_len);
         while !remaining.is_empty() {
             let chunk = remaining.split_to(remaining.len().min(FRAGMENT));
             header.is_final = remaining.is_empty();

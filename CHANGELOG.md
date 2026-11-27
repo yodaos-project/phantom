@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- Fragment large compressed client WebSocket messages into masked frames. Accept
+- Allow WebSocket clients to opt into masked 16 KiB fragments for large compressed
+  messages. The default still sends each message in one frame. Accept
   RFC 7692 final DEFLATE blocks with context takeover and reject truncated
   compressed messages before delivery.
 

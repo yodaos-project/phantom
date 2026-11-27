@@ -1,8 +1,8 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 925c6bf..5ee76d9 100644
+index 7a0464f..28869ef 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -65,6 +65,7 @@ __rustls-tls = [
+@@ -59,6 +59,7 @@ __rustls-tls = [
  default = ["handshake"]
  deflate = [
      "dep:flate2",
@@ -10,7 +10,7 @@ index 925c6bf..5ee76d9 100644
      "dep:http",
  ]
  handshake = [
-@@ -152,6 +153,10 @@ harness = false
+@@ -146,6 +147,10 @@ harness = false
  [dependencies.bytes]
  version = "1.9.0"
  
@@ -280,36 +280,88 @@ index 0000000..08e64b3
 +    }
 +}
 diff --git a/src/protocol/deflate/tests/write.rs b/src/protocol/deflate/tests/write.rs
-index a453771..d9f6a12 100644
+index a453771..be344bf 100644
 --- a/src/protocol/deflate/tests/write.rs
 +++ b/src/protocol/deflate/tests/write.rs
-@@ -357,3 +357,56 @@ fn a_rejected_client_raw_frame_is_returned_masked() {
+@@ -357,3 +357,109 @@ fn a_rejected_client_raw_frame_is_returned_masked() {
          other => panic!("the mask is what pushes this frame past the cap: {other:?}"),
      }
  }
 +
 +#[test]
-+fn compressed_client_fragments_form_one_masked_message() {
++fn compressed_client_messages_use_one_frame_unless_fragmentation_is_enabled() {
 +    use crate::protocol::frame::FrameSocket;
 +
++    // The random-binary-64k corpus from scripts/capture/http2_websocket.py.
++    let mut state = 0x5048_414e_u32;
++    let payload: Vec<_> = (0..64 * 1024)
++        .map(|_| {
++            state ^= state << 13;
++            state ^= state >> 17;
++            state ^= state << 5;
++            state as u8
++        })
++        .collect();
++    let message = Message::binary(payload);
 +    let config = WebSocketConfig::default().enable_deflate();
-+    let mut client = WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
-+    let message = Message::binary(noise(40_000, 7));
-+    client.send(message.clone()).unwrap();
-+    let wire = &client.get_ref().0;
-+    let mut frames = FrameSocket::new(io::Cursor::new(wire));
-+    let opcodes = [OpData::Binary, OpData::Continue, OpData::Continue];
-+    for (i, opcode) in opcodes.into_iter().enumerate() {
-+        let frame = frames.read(Some(16 * 1024)).unwrap().unwrap();
-+        assert_eq!(frame.header().opcode, OpCode::Data(opcode));
-+        assert_eq!(frame.header().rsv1, i == 0);
-+        assert_eq!(frame.header().is_final, i == 2);
-+        assert!(frame.header().mask.is_some());
++    for (client_config, expected_frames) in
++        [(config, 1), (config.fragment_compressed_client_messages(true), 5)]
++    {
++        let mut client =
++            WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(client_config));
++        client.send(message.clone()).unwrap();
++        let wire = &client.get_ref().0;
++        let mut frames = FrameSocket::new(io::Cursor::new(wire));
++        for i in 0..expected_frames {
++            let frame = frames.read(None).unwrap().unwrap();
++            let last = i + 1 == expected_frames;
++            let opcode = if i == 0 { OpData::Binary } else { OpData::Continue };
++            assert_eq!(frame.header().opcode, OpCode::Data(opcode));
++            assert_eq!(frame.header().rsv1, i == 0);
++            assert_eq!(frame.header().is_final, last);
++            assert!(frame.header().mask.is_some());
++            if !last {
++                assert_eq!(frame.payload().len(), 16 * 1024);
++            }
++        }
++        assert!(frames.read(None).unwrap().is_none());
++        let mut peer =
++            WebSocket::from_raw_socket(io::Cursor::new(wire.clone()), Role::Server, Some(config));
++        assert_eq!(peer.read().unwrap(), message);
 +    }
-+    assert!(frames.read(None).unwrap().is_none());
-+    let mut peer =
-+        WebSocket::from_raw_socket(io::Cursor::new(wire.clone()), Role::Server, Some(config));
-+    assert_eq!(peer.read().unwrap(), message);
++}
++
++#[test]
++fn a_short_last_fragment_fits_at_the_exact_masked_wire_size() {
++    use crate::protocol::deflate::{Context, Settings};
++    use crate::protocol::frame::FrameSocket;
++
++    let payload = noise(16 * 1024, 7);
++    let compressed = Context::new(Role::Client, Settings::default()).compress(&payload).unwrap();
++    let tail = compressed.len() - 16 * 1024;
++    assert!((1..=125).contains(&tail));
++    let exact = compressed.len() + 8 + 6;
++    let message = Message::binary(payload);
++    for (cap, lengths) in [(exact, vec![16 * 1024, tail]), (exact - 1, vec![compressed.len()])] {
++        let config = WebSocketConfig::default()
++            .enable_deflate()
++            .fragment_compressed_client_messages(true)
++            .write_buffer_size(0)
++            .max_write_buffer_size(cap);
++        let mut client = WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
++        client.send(message.clone()).unwrap();
++
++        let wire = &client.get_ref().0;
++        let mut frames = FrameSocket::new(io::Cursor::new(wire));
++        for len in lengths {
++            assert_eq!(frames.read(None).unwrap().unwrap().payload().len(), len);
++        }
++        assert!(frames.read(None).unwrap().is_none());
++        assert!(wire.len() <= cap);
++        let mut peer =
++            WebSocket::from_raw_socket(io::Cursor::new(wire.clone()), Role::Server, Some(config));
++        assert_eq!(peer.read().unwrap(), message);
++    }
 +}
 +
 +#[test]
@@ -324,7 +376,8 @@ index a453771..d9f6a12 100644
 +    let config = WebSocketConfig::default()
 +        .write_buffer_size(0)
 +        .max_write_buffer_size(cap)
-+        .enable_deflate();
++        .enable_deflate()
++        .fragment_compressed_client_messages(true);
 +    let mut client = WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
 +    let message = Message::binary(payload);
 +    client.send(message.clone()).unwrap();
@@ -341,10 +394,10 @@ index a453771..d9f6a12 100644
 +    assert_eq!(peer.read().unwrap(), message);
 +}
 diff --git a/src/protocol/frame/mod.rs b/src/protocol/frame/mod.rs
-index b11f2ca..2da4bf3 100644
+index b11f2ca..0ba7dbc 100644
 --- a/src/protocol/frame/mod.rs
 +++ b/src/protocol/frame/mod.rs
-@@ -244,6 +244,39 @@ impl FrameCodec {
+@@ -244,6 +244,43 @@ impl FrameCodec {
          size
      }
  
@@ -357,17 +410,21 @@ index b11f2ca..2da4bf3 100644
 +        if len <= FRAGMENT {
 +            return Ok(false);
 +        }
-+        // Each masked fragment has at most eight header bytes. If the extra headers
-+        // would exceed the write budget, use the original, already-admitted frame.
-+        let headers = len.div_ceil(FRAGMENT) * 8;
-+        if !self.can_buffer(len.saturating_add(headers)) {
++        // The last fragment may use the short payload-length encoding. Count each
++        // wire header with its pending four-byte client mask before advancing the queue.
++        let full_fragments = (len - 1) / FRAGMENT;
++        let last_len = len - full_fragments * FRAGMENT;
++        let masked_header_len = |size: usize| frame.header().len(size as u64) + 4;
++        let headers = full_fragments * masked_header_len(FRAGMENT) + masked_header_len(last_len);
++        let wire_len = len + headers;
++        if !self.can_buffer(wire_len) {
 +            return Ok(false);
 +        }
 +
 +        let start = self.out_buffer.len();
 +        let mut remaining = frame.clone().into_payload();
 +        let mut header = frame.header().clone();
-+        self.out_buffer.reserve(len + headers);
++        self.out_buffer.reserve(wire_len);
 +        while !remaining.is_empty() {
 +            let chunk = remaining.split_to(remaining.len().min(FRAGMENT));
 +            header.is_final = remaining.is_empty();
@@ -384,7 +441,7 @@ index b11f2ca..2da4bf3 100644
      /// Writes a frame into the `out_buffer`.
      /// If the out buffer size is over the `out_buffer_write_len` will also write
      /// the out buffer into the provided `stream`.
-@@ -264,6 +297,10 @@ impl FrameCodec {
+@@ -264,6 +301,10 @@ impl FrameCodec {
          self.out_buffer.reserve(frame.len());
          frame.format_into_buf(&mut self.out_buffer).expect("Bug: can't write to vector");
  
@@ -396,16 +453,55 @@ index b11f2ca..2da4bf3 100644
              self.write_out_buffer(stream)
          } else {
 diff --git a/src/protocol/mod.rs b/src/protocol/mod.rs
-index 15be11e..86f7141 100644
+index 15be11e..af3fd19 100644
 --- a/src/protocol/mod.rs
 +++ b/src/protocol/mod.rs
-@@ -1270,6 +1270,12 @@ impl WebSocketContext {
+@@ -115,6 +115,10 @@ pub struct WebSocketConfig {
+     pub accept_unmasked_frames: bool,
+     #[cfg(feature = "deflate")]
+     pub(crate) deflate: Option<deflate::Settings>,
++    /// Split outgoing compressed client messages into masked 16 KiB fragments when their
++    /// combined wire size fits the write buffer. Defaults to sending one frame per message.
++    #[cfg(feature = "deflate")]
++    pub fragment_compressed_client_messages: bool,
+ }
+ 
+ /// The effective `permessage-deflate` settings agreed by the handshake.
+@@ -162,6 +166,8 @@ impl Default for WebSocketConfig {
+             accept_unmasked_frames: false,
+             #[cfg(feature = "deflate")]
+             deflate: None,
++            #[cfg(feature = "deflate")]
++            fragment_compressed_client_messages: false,
+         }
+     }
+ }
+@@ -187,6 +193,14 @@ impl WebSocketConfig {
+         self
+     }
+ 
++    /// Set [`Self::fragment_compressed_client_messages`]. This local framing policy
++    /// applies when the client sends a compressed message after negotiating deflate.
++    #[cfg(feature = "deflate")]
++    pub fn fragment_compressed_client_messages(mut self, enabled: bool) -> Self {
++        self.fragment_compressed_client_messages = enabled;
++        self
++    }
++
+     /// Caps the LZ77 sliding window for one direction, in bits.
+     ///
+     /// `role` names the direction, not this endpoint: [`Role::Server`] sets
+@@ -1270,6 +1284,16 @@ impl WebSocketContext {
              Role::Client => {
                  // 5.  If the data is being sent by the client, the frame(s) MUST be
                  // masked as defined in Section 5.3. (RFC 6455)
 +                #[cfg(feature = "deflate")]
 +                if carries_compression_state
-+                    && self.frame.queue_client_fragments(&frame).inspect_err(|_| self.fail_compression())?
++                    && self.config.fragment_compressed_client_messages
++                    && self
++                        .frame
++                        .queue_client_fragments(&frame)
++                        .inspect_err(|_| self.fail_compression())?
 +                {
 +                    return self.frame.write_if_ready(stream).check_connection_reset(self.state);
 +                }

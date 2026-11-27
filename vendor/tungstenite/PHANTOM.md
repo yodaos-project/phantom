@@ -59,10 +59,12 @@ checks invalid padding around names and values, plus legal space/tab controls.
 
 ## Client fragmentation and decoder boundary
 
-`rfc7692-client-fragments.patch` queues compressed client payloads over 16 KiB
-as independently masked fragments before writing to the transport. If their
-additional headers exceed the write-buffer limit, the admitted single frame
-still fits.
+`WebSocketConfig::fragment_compressed_client_messages(true)` opts into masked
+16 KiB fragments when client compression is active. The default preserves the
+single frame observed in the browser captures for the 64 KiB random message.
+The codec queues all fragments before writing and counts the final fragment's
+actual header size against the write budget. If only the original single
+frame fits, it sends that frame.
 
 The private `protocol/deflate/codec/decoder.rs` module owns the zlib-rs raw
 inflater. Its C API exposes the sync-point check for the four omitted trailer
