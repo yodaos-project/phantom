@@ -1270,6 +1270,12 @@ impl WebSocketContext {
             Role::Client => {
                 // 5.  If the data is being sent by the client, the frame(s) MUST be
                 // masked as defined in Section 5.3. (RFC 6455)
+                #[cfg(feature = "deflate")]
+                if carries_compression_state
+                    && self.frame.queue_client_fragments(&frame).inspect_err(|_| self.fail_compression())?
+                {
+                    return self.frame.write_if_ready(stream).check_connection_reset(self.state);
+                }
                 frame.set_random_mask().inspect_err(|_| {
                     #[cfg(feature = "deflate")]
                     if carries_compression_state {

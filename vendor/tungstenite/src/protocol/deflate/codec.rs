@@ -1,5 +1,8 @@
 use bytes::Bytes;
-use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
+use flate2::{Compress, FlushCompress, Status};
+use self::decoder::ConfiguredDecoder;
+
+mod decoder;
 
 use super::Settings;
 use crate::{
@@ -13,58 +16,6 @@ pub(crate) struct Context {
     decoder: ConfiguredDecoder,
     reset_encoder: bool,
     reset_decoder: bool,
-}
-
-/// An inflater that remembers the window it was built with.
-///
-/// `Decompress::reset` takes no width and restores a 15-bit window on every backend flate2
-/// admits, so resetting a negotiated narrower decoder silently widens it. Reconstructing keeps
-/// the memory reduction those parameters exist for -- RFC 7692 §7.1.2.1 for a client's decoder,
-/// §7.1.2.2 for a server's -- across the whole connection, not until the first reset.
-#[derive(Debug)]
-struct ConfiguredDecoder {
-    stream: Decompress,
-    window_bits: u8,
-}
-
-/// A 15-bit inflater is what `Decompress::reset` produces anyway, so only a narrower one
-/// has to be rebuilt. Keeping the rule here rather than at the reset sites means both of
-/// them share it.
-fn reconstructs_on_reset(window_bits: u8) -> bool {
-    window_bits < 15
-}
-
-impl ConfiguredDecoder {
-    fn new(role: Role, settings: Settings) -> Self {
-        let peer_window = match role {
-            Role::Client => settings.server_max_window_bits,
-            Role::Server => settings.client_max_window_bits,
-        };
-        // flate2 asserts 9..=15 in both constructors and RFC 7692 permits a negotiated 8, which
-        // neither accept path bounds from below -- hence the clamp. Inflating wider than the
-        // peer encoded with is always safe.
-        let window_bits = peer_window.max(9);
-        Self { stream: Decompress::new_with_window_bits(false, window_bits), window_bits }
-    }
-
-    fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<(Status, usize, usize)> {
-        let before = (self.stream.total_in(), self.stream.total_out());
-        let status = self
-            .stream
-            .decompress(input, output, FlushDecompress::None)
-            .map_err(|_| ProtocolError::Compression)?;
-        let consumed = (self.stream.total_in() - before.0) as usize;
-        let produced = (self.stream.total_out() - before.1) as usize;
-        Ok((status, consumed, produced))
-    }
-
-    fn reset(&mut self) {
-        if reconstructs_on_reset(self.window_bits) {
-            self.stream = Decompress::new_with_window_bits(false, self.window_bits);
-        } else {
-            self.stream.reset(false);
-        }
-    }
 }
 
 impl Context {
@@ -150,6 +101,10 @@ impl Context {
         let mut output = Vec::new();
         self.inflate(input, already, max_size, &mut output)?;
         if final_frame {
+            // The four omitted LEN/NLEN bytes must complete an empty stored block.
+            if !self.decoder.at_sync_point() {
+                return Err(ProtocolError::Compression.into());
+            }
             self.inflate(TRAILER, already, max_size, &mut output)?;
             if self.reset_decoder {
                 self.decoder.reset();
@@ -180,9 +135,6 @@ impl Context {
                 .into());
             }
             input = &input[consumed..];
-            if status == Status::StreamEnd {
-                return Err(ProtocolError::Compression.into());
-            }
             if !progress(status, consumed, produced)? {
                 return Ok(());
             }
@@ -213,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_final_deflate_block() {
+    fn rejects_a_final_deflate_block_missing_the_empty_stored_block() {
         let mut context = Context::new(Role::Client, Settings::default());
         let error = context
             .decompress(&[0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00], true, 0, Some(64))
@@ -221,37 +173,25 @@ mod tests {
         assert!(matches!(error, Error::Protocol(ProtocolError::Compression)));
     }
 
-    /// The decoder's width is the *peer's* agreed window, never the endpoint's own, and an
-    /// agreed 8 -- legal under RFC 7692, unconstructible in flate2 -- is stored as the
-    /// effective 9. Both cases set the two windows apart, because equal values would pass
-    /// whichever field the mapping read.
     #[test]
-    fn the_configured_decoder_stores_the_peers_effective_window() {
-        let server = ConfiguredDecoder::new(
-            Role::Server,
-            Settings {
-                server_max_window_bits: 10,
-                client_max_window_bits: 15,
-                ..Settings::default()
-            },
-        );
-        assert_eq!(server.window_bits, 15);
+    fn final_blocks_preserve_history_and_may_end_at_a_fragment_boundary() {
+        let mut client = Context::new(Role::Client, Settings::default());
+        let first =
+            client.decompress(&[0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00], false, 0, None).unwrap();
+        assert_eq!(first.as_ref(), b"Hello");
+        assert!(client.decompress(&[0], true, first.len(), None).unwrap().is_empty());
+        let repeated = client.decompress(&[0xf2, 0x00, 0x11, 0x00, 0x00], true, 0, None).unwrap();
+        assert_eq!(repeated.as_ref(), b"Hello");
+    }
 
-        let client = ConfiguredDecoder::new(
-            Role::Client,
-            Settings {
-                client_max_window_bits: 10,
-                server_max_window_bits: 8,
-                ..Settings::default()
-            },
-        );
-        assert_eq!(client.window_bits, 9, "an agreed 8 is stored as the constructible 9");
+    #[test]
+    fn rejects_a_truncated_sync_flush_message() {
+        let mut client = Context::new(Role::Client, Settings::default());
+        assert!(client.decompress(&[0xf2, 0x48, 0xcd], true, 0, None).is_err());
+    }
 
-        for bits in 9..=14 {
-            assert!(reconstructs_on_reset(bits), "a {bits}-bit decoder must be rebuilt");
-        }
-        assert!(!reconstructs_on_reset(15), "a 15-bit decoder keeps the in-place reset");
-
+    #[test]
+    fn decodes_with_the_negotiated_peer_window() {
         let mut client = Context::new(
             Role::Client,
             Settings { server_max_window_bits: 8, ..Settings::default() },

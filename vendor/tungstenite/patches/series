@@ -5,4 +5,5 @@ message-fragment-limit.patch
 deprecated-max-value.patch
 deflate-http-whitespace-tests.patch
 deflate-http-whitespace.patch
+rfc7692-client-fragments.patch
 publish-identity.patch

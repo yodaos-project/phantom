@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.85"
 name = "phantom-tungstenite"
-version = "0.30.0-phantom.3"
+version = "0.30.0-phantom.4"
 authors = [
     "Alexey Galakhov",
     "Daniel Abramov",
@@ -65,6 +65,7 @@ __rustls-tls = [
 default = ["handshake"]
 deflate = [
     "dep:flate2",
+    "dep:libz-rs-sys",
     "dep:http",
 ]
 handshake = [
@@ -151,6 +152,10 @@ harness = false
 
 [dependencies.bytes]
 version = "1.9.0"
+
+[dependencies.libz-rs-sys]
+version = "0.6.9"
+optional = true
 
 [dependencies.flate2]
 version = "1.0.31"

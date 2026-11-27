@@ -244,6 +244,39 @@ impl FrameCodec {
         size
     }
 
+    /// Queue a large compressed client message atomically. A pending transport write can
+    /// then resume at any byte without re-compressing or losing a continuation frame.
+    #[cfg(feature = "deflate")]
+    pub(super) fn queue_client_fragments(&mut self, frame: &Frame) -> Result<bool> {
+        const FRAGMENT: usize = 16 * 1024;
+        let len = frame.payload().len();
+        if len <= FRAGMENT {
+            return Ok(false);
+        }
+        // Each masked fragment has at most eight header bytes. If the extra headers
+        // would exceed the write budget, use the original, already-admitted frame.
+        let headers = len.div_ceil(FRAGMENT) * 8;
+        if !self.can_buffer(len.saturating_add(headers)) {
+            return Ok(false);
+        }
+
+        let start = self.out_buffer.len();
+        let mut remaining = frame.clone().into_payload();
+        let mut header = frame.header().clone();
+        self.out_buffer.reserve(len + headers);
+        while !remaining.is_empty() {
+            let chunk = remaining.split_to(remaining.len().min(FRAGMENT));
+            header.is_final = remaining.is_empty();
+            header.set_random_mask().inspect_err(|_| self.out_buffer.truncate(start))?;
+            Frame::from_payload(header.clone(), chunk)
+                .format_into_buf(&mut self.out_buffer)
+                .expect("writing a frame to Vec cannot fail");
+            header.rsv1 = false;
+            header.opcode = coding::OpCode::Data(coding::Data::Continue);
+        }
+        Ok(true)
+    }
+
     /// Writes a frame into the `out_buffer`.
     /// If the out buffer size is over the `out_buffer_write_len` will also write
     /// the out buffer into the provided `stream`.
@@ -264,6 +297,10 @@ impl FrameCodec {
         self.out_buffer.reserve(frame.len());
         frame.format_into_buf(&mut self.out_buffer).expect("Bug: can't write to vector");
 
+        self.write_if_ready(stream)
+    }
+
+    pub(super) fn write_if_ready(&mut self, stream: &mut impl Write) -> Result<()> {
         if self.out_buffer.len() > self.out_buffer_write_len {
             self.write_out_buffer(stream)
         } else {

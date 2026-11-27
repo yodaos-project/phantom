@@ -12,7 +12,7 @@ unrecorded edit to the vendored crate.
 
 `publish-identity.patch` is always the last entry in `patches/series`. It
 renames the package (`tungstenite` becomes `phantom-tungstenite` at
-`0.30.0-phantom.3`), keeps the upstream library name so source, tests, and
+`0.30.0-phantom.4`), keeps the upstream library name so source, tests, and
 examples are unchanged, and points the repository metadata at Phantom. It
 removes the upstream documentation link, keeps Cargo's reserved archive files
 out of the packaged crate, and records the upstream package, version, and
@@ -41,7 +41,7 @@ from upstream pull request 561, keeps frame and message payloads out of logs
 and errors, makes client masking entropy failure an ordinary result, and
 reports forbidden peer Close codes instead of rewriting them. A small
 integration patch exposes ordered negotiation for Phantom's custom handshake,
-rejects terminal raw-DEFLATE streams, and keeps an 8-bit negotiated window
+configures raw DEFLATE, and keeps an 8-bit negotiated window
 within its wire bound. The default-preserving `message-fragment-limit.patch`
 adds an opt-in per-message data fragment count, rejects overflow before
 decompression or reassembly, and makes that receive failure terminal. The
@@ -56,6 +56,23 @@ Rust 1.99 deprecates, with `usize::MAX`. It changes no behavior, and upstream
 to HTTP space and horizontal tab. Unicode whitespace remains part of the
 parameter and is rejected by its grammar. The separate regression patch
 checks invalid padding around names and values, plus legal space/tab controls.
+
+## Client fragmentation and decoder boundary
+
+`rfc7692-client-fragments.patch` queues compressed client payloads over 16 KiB
+as independently masked fragments before writing to the transport. If their
+additional headers exceed the write-buffer limit, the admitted single frame
+still fits.
+
+The private `protocol/deflate/codec/decoder.rs` module owns the zlib-rs raw
+inflater. Its C API exposes the sync-point check for the four omitted trailer
+bytes and the history-preserving reset needed at BFINAL boundaries (RFC 7692
+sections 7.2.1 and 7.2.3.4). Each successful initialization owns one allocation
+and its destructor ends the stream once. Calls borrow input and bounded scratch
+slices exclusively for the duration of inflation and clear their pointers
+before returning. Moving the decoder transfers exclusive ownership. Shared
+access exposes no stream operation. The outer codec enforces the cumulative
+inflated message limit across continuation frames.
 
 ## Required check
 
