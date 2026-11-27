@@ -244,6 +244,43 @@ impl FrameCodec {
         size
     }
 
+    /// Queue a large compressed client message atomically. A pending transport write can
+    /// then resume at any byte without re-compressing or losing a continuation frame.
+    #[cfg(feature = "deflate")]
+    pub(super) fn queue_client_fragments(&mut self, frame: &Frame) -> Result<bool> {
+        const FRAGMENT: usize = 16 * 1024;
+        let len = frame.payload().len();
+        if len <= FRAGMENT {
+            return Ok(false);
+        }
+        // The last fragment may use the short payload-length encoding. Count each
+        // wire header with its pending four-byte client mask before advancing the queue.
+        let full_fragments = (len - 1) / FRAGMENT;
+        let last_len = len - full_fragments * FRAGMENT;
+        let masked_header_len = |size: usize| frame.header().len(size as u64) + 4;
+        let headers = full_fragments * masked_header_len(FRAGMENT) + masked_header_len(last_len);
+        let wire_len = len + headers;
+        if !self.can_buffer(wire_len) {
+            return Ok(false);
+        }
+
+        let start = self.out_buffer.len();
+        let mut remaining = frame.clone().into_payload();
+        let mut header = frame.header().clone();
+        self.out_buffer.reserve(wire_len);
+        while !remaining.is_empty() {
+            let chunk = remaining.split_to(remaining.len().min(FRAGMENT));
+            header.is_final = remaining.is_empty();
+            header.set_random_mask().inspect_err(|_| self.out_buffer.truncate(start))?;
+            Frame::from_payload(header.clone(), chunk)
+                .format_into_buf(&mut self.out_buffer)
+                .expect("writing a frame to Vec cannot fail");
+            header.rsv1 = false;
+            header.opcode = coding::OpCode::Data(coding::Data::Continue);
+        }
+        Ok(true)
+    }
+
     /// Writes a frame into the `out_buffer`.
     /// If the out buffer size is over the `out_buffer_write_len` will also write
     /// the out buffer into the provided `stream`.
@@ -264,6 +301,10 @@ impl FrameCodec {
         self.out_buffer.reserve(frame.len());
         frame.format_into_buf(&mut self.out_buffer).expect("Bug: can't write to vector");
 
+        self.write_if_ready(stream)
+    }
+
+    pub(super) fn write_if_ready(&mut self, stream: &mut impl Write) -> Result<()> {
         if self.out_buffer.len() > self.out_buffer_write_len {
             self.write_out_buffer(stream)
         } else {

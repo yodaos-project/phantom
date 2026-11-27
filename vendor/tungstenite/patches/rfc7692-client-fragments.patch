@@ -1,0 +1,510 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 7a0464f..28869ef 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -59,6 +59,7 @@ __rustls-tls = [
+ default = ["handshake"]
+ deflate = [
+     "dep:flate2",
++    "dep:libz-rs-sys",
+     "dep:http",
+ ]
+ handshake = [
+@@ -146,6 +147,10 @@ harness = false
+ [dependencies.bytes]
+ version = "1.9.0"
+ 
++[dependencies.libz-rs-sys]
++version = "0.6.9"
++optional = true
++
+ [dependencies.flate2]
+ version = "1.0.31"
+ features = ["zlib-rs"]
+diff --git a/src/protocol/deflate/codec.rs b/src/protocol/deflate/codec.rs
+index e175f42..7d6d27e 100644
+--- a/src/protocol/deflate/codec.rs
++++ b/src/protocol/deflate/codec.rs
+@@ -1,5 +1,8 @@
+ use bytes::Bytes;
+-use flate2::{Compress, Decompress, FlushCompress, FlushDecompress, Status};
++use flate2::{Compress, FlushCompress, Status};
++use self::decoder::ConfiguredDecoder;
++
++mod decoder;
+ 
+ use super::Settings;
+ use crate::{
+@@ -15,58 +18,6 @@ pub(crate) struct Context {
+     reset_decoder: bool,
+ }
+ 
+-/// An inflater that remembers the window it was built with.
+-///
+-/// `Decompress::reset` takes no width and restores a 15-bit window on every backend flate2
+-/// admits, so resetting a negotiated narrower decoder silently widens it. Reconstructing keeps
+-/// the memory reduction those parameters exist for -- RFC 7692 §7.1.2.1 for a client's decoder,
+-/// §7.1.2.2 for a server's -- across the whole connection, not until the first reset.
+-#[derive(Debug)]
+-struct ConfiguredDecoder {
+-    stream: Decompress,
+-    window_bits: u8,
+-}
+-
+-/// A 15-bit inflater is what `Decompress::reset` produces anyway, so only a narrower one
+-/// has to be rebuilt. Keeping the rule here rather than at the reset sites means both of
+-/// them share it.
+-fn reconstructs_on_reset(window_bits: u8) -> bool {
+-    window_bits < 15
+-}
+-
+-impl ConfiguredDecoder {
+-    fn new(role: Role, settings: Settings) -> Self {
+-        let peer_window = match role {
+-            Role::Client => settings.server_max_window_bits,
+-            Role::Server => settings.client_max_window_bits,
+-        };
+-        // flate2 asserts 9..=15 in both constructors and RFC 7692 permits a negotiated 8, which
+-        // neither accept path bounds from below -- hence the clamp. Inflating wider than the
+-        // peer encoded with is always safe.
+-        let window_bits = peer_window.max(9);
+-        Self { stream: Decompress::new_with_window_bits(false, window_bits), window_bits }
+-    }
+-
+-    fn decompress(&mut self, input: &[u8], output: &mut [u8]) -> Result<(Status, usize, usize)> {
+-        let before = (self.stream.total_in(), self.stream.total_out());
+-        let status = self
+-            .stream
+-            .decompress(input, output, FlushDecompress::None)
+-            .map_err(|_| ProtocolError::Compression)?;
+-        let consumed = (self.stream.total_in() - before.0) as usize;
+-        let produced = (self.stream.total_out() - before.1) as usize;
+-        Ok((status, consumed, produced))
+-    }
+-
+-    fn reset(&mut self) {
+-        if reconstructs_on_reset(self.window_bits) {
+-            self.stream = Decompress::new_with_window_bits(false, self.window_bits);
+-        } else {
+-            self.stream.reset(false);
+-        }
+-    }
+-}
+-
+ impl Context {
+     pub(crate) fn new(role: Role, settings: Settings) -> Self {
+         let (own_window, reset_encoder, reset_decoder) = match role {
+@@ -150,6 +101,10 @@ impl Context {
+         let mut output = Vec::new();
+         self.inflate(input, already, max_size, &mut output)?;
+         if final_frame {
++            // The four omitted LEN/NLEN bytes must complete an empty stored block.
++            if !self.decoder.at_sync_point() {
++                return Err(ProtocolError::Compression.into());
++            }
+             self.inflate(TRAILER, already, max_size, &mut output)?;
+             if self.reset_decoder {
+                 self.decoder.reset();
+@@ -180,9 +135,6 @@ impl Context {
+                 .into());
+             }
+             input = &input[consumed..];
+-            if status == Status::StreamEnd {
+-                return Err(ProtocolError::Compression.into());
+-            }
+             if !progress(status, consumed, produced)? {
+                 return Ok(());
+             }
+@@ -213,7 +165,7 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn rejects_a_final_deflate_block() {
++    fn rejects_a_final_deflate_block_missing_the_empty_stored_block() {
+         let mut context = Context::new(Role::Client, Settings::default());
+         let error = context
+             .decompress(&[0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00], true, 0, Some(64))
+@@ -221,37 +173,25 @@ mod tests {
+         assert!(matches!(error, Error::Protocol(ProtocolError::Compression)));
+     }
+ 
+-    /// The decoder's width is the *peer's* agreed window, never the endpoint's own, and an
+-    /// agreed 8 -- legal under RFC 7692, unconstructible in flate2 -- is stored as the
+-    /// effective 9. Both cases set the two windows apart, because equal values would pass
+-    /// whichever field the mapping read.
+     #[test]
+-    fn the_configured_decoder_stores_the_peers_effective_window() {
+-        let server = ConfiguredDecoder::new(
+-            Role::Server,
+-            Settings {
+-                server_max_window_bits: 10,
+-                client_max_window_bits: 15,
+-                ..Settings::default()
+-            },
+-        );
+-        assert_eq!(server.window_bits, 15);
+-
+-        let client = ConfiguredDecoder::new(
+-            Role::Client,
+-            Settings {
+-                client_max_window_bits: 10,
+-                server_max_window_bits: 8,
+-                ..Settings::default()
+-            },
+-        );
+-        assert_eq!(client.window_bits, 9, "an agreed 8 is stored as the constructible 9");
++    fn final_blocks_preserve_history_and_may_end_at_a_fragment_boundary() {
++        let mut client = Context::new(Role::Client, Settings::default());
++        let first =
++            client.decompress(&[0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00], false, 0, None).unwrap();
++        assert_eq!(first.as_ref(), b"Hello");
++        assert!(client.decompress(&[0], true, first.len(), None).unwrap().is_empty());
++        let repeated = client.decompress(&[0xf2, 0x00, 0x11, 0x00, 0x00], true, 0, None).unwrap();
++        assert_eq!(repeated.as_ref(), b"Hello");
++    }
+ 
+-        for bits in 9..=14 {
+-            assert!(reconstructs_on_reset(bits), "a {bits}-bit decoder must be rebuilt");
+-        }
+-        assert!(!reconstructs_on_reset(15), "a 15-bit decoder keeps the in-place reset");
++    #[test]
++    fn rejects_a_truncated_sync_flush_message() {
++        let mut client = Context::new(Role::Client, Settings::default());
++        assert!(client.decompress(&[0xf2, 0x48, 0xcd], true, 0, None).is_err());
++    }
+ 
++    #[test]
++    fn decodes_with_the_negotiated_peer_window() {
+         let mut client = Context::new(
+             Role::Client,
+             Settings { server_max_window_bits: 8, ..Settings::default() },
+diff --git a/src/protocol/deflate/codec/decoder.rs b/src/protocol/deflate/codec/decoder.rs
+new file mode 100644
+index 0000000..08e64b3
+--- /dev/null
++++ b/src/protocol/deflate/codec/decoder.rs
+@@ -0,0 +1,95 @@
++use super::{ProtocolError, Result, Role, Settings, Status};
++use libz_rs_sys as zlib;
++
++/// Raw inflater with access to zlib's sync-point and history-preserving reset.
++pub(super) struct ConfiguredDecoder {
++    stream: zlib::z_stream,
++}
++
++// SAFETY: The decoder exclusively owns its zlib-rs allocation and uses the
++// process allocator. Input and output slices are borrowed only inside decompress.
++unsafe impl Send for ConfiguredDecoder {}
++unsafe impl Sync for ConfiguredDecoder {}
++
++impl std::fmt::Debug for ConfiguredDecoder {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("ConfiguredDecoder").finish_non_exhaustive()
++    }
++}
++
++impl ConfiguredDecoder {
++    pub(super) fn new(role: Role, settings: Settings) -> Self {
++        let peer_window = match role {
++            Role::Client => settings.server_max_window_bits,
++            Role::Server => settings.client_max_window_bits,
++        };
++        let mut stream = zlib::z_stream::default();
++        // SAFETY: The default stream supplies a matching allocator pair. The
++        // version and size come from the same library that initializes it.
++        let status = unsafe {
++            zlib::inflateInit2_(
++                &mut stream,
++                -i32::from(peer_window),
++                zlib::zlibVersion(),
++                std::mem::size_of::<zlib::z_stream>() as i32,
++            )
++        };
++        assert_eq!(status, zlib::Z_OK);
++        Self { stream }
++    }
++
++    pub(super) fn decompress(
++        &mut self,
++        input: &[u8],
++        output: &mut [u8],
++    ) -> Result<(Status, usize, usize)> {
++        let input_len = input.len().min(u32::MAX as usize) as u32;
++        let output_len = u32::try_from(output.len()).expect("bounded inflate scratch buffer");
++        self.stream.next_in = input.as_ptr();
++        self.stream.avail_in = input_len;
++        self.stream.next_out = output.as_mut_ptr();
++        self.stream.avail_out = output_len;
++        // SAFETY: Both buffers cover the indicated lengths and live through this
++        // call. Clear their pointers before either borrow can end.
++        let status = unsafe { zlib::inflate(&mut self.stream, zlib::Z_NO_FLUSH) };
++        let consumed = input_len - self.stream.avail_in;
++        let produced = output_len - self.stream.avail_out;
++        self.stream.next_in = std::ptr::null();
++        self.stream.next_out = std::ptr::null_mut();
++        self.stream.avail_in = 0;
++        self.stream.avail_out = 0;
++        let status = match status {
++            zlib::Z_OK => Status::Ok,
++            zlib::Z_BUF_ERROR => Status::BufError,
++            zlib::Z_STREAM_END => {
++                // RFC 7692 section 7.2.1 permits BFINAL before another block.
++                // SAFETY: The stream is initialized and exclusively borrowed.
++                let reset = unsafe { zlib::inflateResetKeep(&mut self.stream) };
++                if reset != zlib::Z_OK {
++                    return Err(ProtocolError::Compression.into());
++                }
++                Status::StreamEnd
++            }
++            _ => return Err(ProtocolError::Compression.into()),
++        };
++        Ok((status, consumed as usize, produced as usize))
++    }
++
++    pub(super) fn at_sync_point(&mut self) -> bool {
++        // SAFETY: The stream is initialized and exclusively borrowed.
++        unsafe { zlib::inflateSyncPoint(&mut self.stream) == 1 }
++    }
++
++    pub(super) fn reset(&mut self) {
++        // SAFETY: The stream is initialized and exclusively borrowed. inflateReset
++        // clears the window contents while preserving its negotiated width.
++        assert_eq!(unsafe { zlib::inflateReset(&mut self.stream) }, zlib::Z_OK);
++    }
++}
++
++impl Drop for ConfiguredDecoder {
++    fn drop(&mut self) {
++        // SAFETY: Each successful initialization has exactly one owner.
++        unsafe { zlib::inflateEnd(&mut self.stream) };
++    }
++}
+diff --git a/src/protocol/deflate/tests/write.rs b/src/protocol/deflate/tests/write.rs
+index a453771..be344bf 100644
+--- a/src/protocol/deflate/tests/write.rs
++++ b/src/protocol/deflate/tests/write.rs
+@@ -357,3 +357,109 @@ fn a_rejected_client_raw_frame_is_returned_masked() {
+         other => panic!("the mask is what pushes this frame past the cap: {other:?}"),
+     }
+ }
++
++#[test]
++fn compressed_client_messages_use_one_frame_unless_fragmentation_is_enabled() {
++    use crate::protocol::frame::FrameSocket;
++
++    // The random-binary-64k corpus from scripts/capture/http2_websocket.py.
++    let mut state = 0x5048_414e_u32;
++    let payload: Vec<_> = (0..64 * 1024)
++        .map(|_| {
++            state ^= state << 13;
++            state ^= state >> 17;
++            state ^= state << 5;
++            state as u8
++        })
++        .collect();
++    let message = Message::binary(payload);
++    let config = WebSocketConfig::default().enable_deflate();
++    for (client_config, expected_frames) in
++        [(config, 1), (config.fragment_compressed_client_messages(true), 5)]
++    {
++        let mut client =
++            WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(client_config));
++        client.send(message.clone()).unwrap();
++        let wire = &client.get_ref().0;
++        let mut frames = FrameSocket::new(io::Cursor::new(wire));
++        for i in 0..expected_frames {
++            let frame = frames.read(None).unwrap().unwrap();
++            let last = i + 1 == expected_frames;
++            let opcode = if i == 0 { OpData::Binary } else { OpData::Continue };
++            assert_eq!(frame.header().opcode, OpCode::Data(opcode));
++            assert_eq!(frame.header().rsv1, i == 0);
++            assert_eq!(frame.header().is_final, last);
++            assert!(frame.header().mask.is_some());
++            if !last {
++                assert_eq!(frame.payload().len(), 16 * 1024);
++            }
++        }
++        assert!(frames.read(None).unwrap().is_none());
++        let mut peer =
++            WebSocket::from_raw_socket(io::Cursor::new(wire.clone()), Role::Server, Some(config));
++        assert_eq!(peer.read().unwrap(), message);
++    }
++}
++
++#[test]
++fn a_short_last_fragment_fits_at_the_exact_masked_wire_size() {
++    use crate::protocol::deflate::{Context, Settings};
++    use crate::protocol::frame::FrameSocket;
++
++    let payload = noise(16 * 1024, 7);
++    let compressed = Context::new(Role::Client, Settings::default()).compress(&payload).unwrap();
++    let tail = compressed.len() - 16 * 1024;
++    assert!((1..=125).contains(&tail));
++    let exact = compressed.len() + 8 + 6;
++    let message = Message::binary(payload);
++    for (cap, lengths) in [(exact, vec![16 * 1024, tail]), (exact - 1, vec![compressed.len()])] {
++        let config = WebSocketConfig::default()
++            .enable_deflate()
++            .fragment_compressed_client_messages(true)
++            .write_buffer_size(0)
++            .max_write_buffer_size(cap);
++        let mut client = WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
++        client.send(message.clone()).unwrap();
++
++        let wire = &client.get_ref().0;
++        let mut frames = FrameSocket::new(io::Cursor::new(wire));
++        for len in lengths {
++            assert_eq!(frames.read(None).unwrap().unwrap().payload().len(), len);
++        }
++        assert!(frames.read(None).unwrap().is_none());
++        assert!(wire.len() <= cap);
++        let mut peer =
++            WebSocket::from_raw_socket(io::Cursor::new(wire.clone()), Role::Server, Some(config));
++        assert_eq!(peer.read().unwrap(), message);
++    }
++}
++
++#[test]
++fn a_client_can_use_the_admitted_single_frame_at_the_write_limit() {
++    use crate::protocol::deflate::{Context, Settings};
++    use crate::protocol::frame::FrameSocket;
++
++    let payload = noise(40_000, 7);
++    let compressed = Context::new(Role::Client, Settings::default()).compress(&payload).unwrap();
++    let frame = Frame::message(compressed, OpCode::Data(OpData::Binary), true);
++    let cap = wire_size(Role::Client, &frame);
++    let config = WebSocketConfig::default()
++        .write_buffer_size(0)
++        .max_write_buffer_size(cap)
++        .enable_deflate()
++        .fragment_compressed_client_messages(true);
++    let mut client = WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
++    let message = Message::binary(payload);
++    client.send(message.clone()).unwrap();
++
++    let wire = &client.get_ref().0;
++    assert_eq!(wire.len(), cap);
++    let mut frames = FrameSocket::new(io::Cursor::new(wire));
++    let frame = frames.read(Some(cap)).unwrap().unwrap();
++    assert!(frame.header().rsv1 && frame.header().is_final);
++    assert!(frame.header().mask.is_some());
++    assert!(frames.read(None).unwrap().is_none());
++    let mut peer =
++        WebSocket::from_raw_socket(io::Cursor::new(wire.clone()), Role::Server, Some(config));
++    assert_eq!(peer.read().unwrap(), message);
++}
+diff --git a/src/protocol/frame/mod.rs b/src/protocol/frame/mod.rs
+index b11f2ca..0ba7dbc 100644
+--- a/src/protocol/frame/mod.rs
++++ b/src/protocol/frame/mod.rs
+@@ -244,6 +244,43 @@ impl FrameCodec {
+         size
+     }
+ 
++    /// Queue a large compressed client message atomically. A pending transport write can
++    /// then resume at any byte without re-compressing or losing a continuation frame.
++    #[cfg(feature = "deflate")]
++    pub(super) fn queue_client_fragments(&mut self, frame: &Frame) -> Result<bool> {
++        const FRAGMENT: usize = 16 * 1024;
++        let len = frame.payload().len();
++        if len <= FRAGMENT {
++            return Ok(false);
++        }
++        // The last fragment may use the short payload-length encoding. Count each
++        // wire header with its pending four-byte client mask before advancing the queue.
++        let full_fragments = (len - 1) / FRAGMENT;
++        let last_len = len - full_fragments * FRAGMENT;
++        let masked_header_len = |size: usize| frame.header().len(size as u64) + 4;
++        let headers = full_fragments * masked_header_len(FRAGMENT) + masked_header_len(last_len);
++        let wire_len = len + headers;
++        if !self.can_buffer(wire_len) {
++            return Ok(false);
++        }
++
++        let start = self.out_buffer.len();
++        let mut remaining = frame.clone().into_payload();
++        let mut header = frame.header().clone();
++        self.out_buffer.reserve(wire_len);
++        while !remaining.is_empty() {
++            let chunk = remaining.split_to(remaining.len().min(FRAGMENT));
++            header.is_final = remaining.is_empty();
++            header.set_random_mask().inspect_err(|_| self.out_buffer.truncate(start))?;
++            Frame::from_payload(header.clone(), chunk)
++                .format_into_buf(&mut self.out_buffer)
++                .expect("writing a frame to Vec cannot fail");
++            header.rsv1 = false;
++            header.opcode = coding::OpCode::Data(coding::Data::Continue);
++        }
++        Ok(true)
++    }
++
+     /// Writes a frame into the `out_buffer`.
+     /// If the out buffer size is over the `out_buffer_write_len` will also write
+     /// the out buffer into the provided `stream`.
+@@ -264,6 +301,10 @@ impl FrameCodec {
+         self.out_buffer.reserve(frame.len());
+         frame.format_into_buf(&mut self.out_buffer).expect("Bug: can't write to vector");
+ 
++        self.write_if_ready(stream)
++    }
++
++    pub(super) fn write_if_ready(&mut self, stream: &mut impl Write) -> Result<()> {
+         if self.out_buffer.len() > self.out_buffer_write_len {
+             self.write_out_buffer(stream)
+         } else {
+diff --git a/src/protocol/mod.rs b/src/protocol/mod.rs
+index 15be11e..af3fd19 100644
+--- a/src/protocol/mod.rs
++++ b/src/protocol/mod.rs
+@@ -115,6 +115,10 @@ pub struct WebSocketConfig {
+     pub accept_unmasked_frames: bool,
+     #[cfg(feature = "deflate")]
+     pub(crate) deflate: Option<deflate::Settings>,
++    /// Split outgoing compressed client messages into masked 16 KiB fragments when their
++    /// combined wire size fits the write buffer. Defaults to sending one frame per message.
++    #[cfg(feature = "deflate")]
++    pub fragment_compressed_client_messages: bool,
+ }
+ 
+ /// The effective `permessage-deflate` settings agreed by the handshake.
+@@ -162,6 +166,8 @@ impl Default for WebSocketConfig {
+             accept_unmasked_frames: false,
+             #[cfg(feature = "deflate")]
+             deflate: None,
++            #[cfg(feature = "deflate")]
++            fragment_compressed_client_messages: false,
+         }
+     }
+ }
+@@ -187,6 +193,14 @@ impl WebSocketConfig {
+         self
+     }
+ 
++    /// Set [`Self::fragment_compressed_client_messages`]. This local framing policy
++    /// applies when the client sends a compressed message after negotiating deflate.
++    #[cfg(feature = "deflate")]
++    pub fn fragment_compressed_client_messages(mut self, enabled: bool) -> Self {
++        self.fragment_compressed_client_messages = enabled;
++        self
++    }
++
+     /// Caps the LZ77 sliding window for one direction, in bits.
+     ///
+     /// `role` names the direction, not this endpoint: [`Role::Server`] sets
+@@ -1270,6 +1284,16 @@ impl WebSocketContext {
+             Role::Client => {
+                 // 5.  If the data is being sent by the client, the frame(s) MUST be
+                 // masked as defined in Section 5.3. (RFC 6455)
++                #[cfg(feature = "deflate")]
++                if carries_compression_state
++                    && self.config.fragment_compressed_client_messages
++                    && self
++                        .frame
++                        .queue_client_fragments(&frame)
++                        .inspect_err(|_| self.fail_compression())?
++                {
++                    return self.frame.write_if_ready(stream).check_connection_reset(self.state);
++                }
+                 frame.set_random_mask().inspect_err(|_| {
+                     #[cfg(feature = "deflate")]
+                     if carries_compression_state {

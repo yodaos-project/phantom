@@ -115,6 +115,10 @@ pub struct WebSocketConfig {
     pub accept_unmasked_frames: bool,
     #[cfg(feature = "deflate")]
     pub(crate) deflate: Option<deflate::Settings>,
+    /// Split outgoing compressed client messages into masked 16 KiB fragments when their
+    /// combined wire size fits the write buffer. Defaults to sending one frame per message.
+    #[cfg(feature = "deflate")]
+    pub fragment_compressed_client_messages: bool,
 }
 
 /// The effective `permessage-deflate` settings agreed by the handshake.
@@ -162,6 +166,8 @@ impl Default for WebSocketConfig {
             accept_unmasked_frames: false,
             #[cfg(feature = "deflate")]
             deflate: None,
+            #[cfg(feature = "deflate")]
+            fragment_compressed_client_messages: false,
         }
     }
 }
@@ -184,6 +190,14 @@ impl WebSocketConfig {
     #[cfg(feature = "deflate")]
     pub fn enable_deflate(mut self) -> Self {
         self.deflate.get_or_insert_default();
+        self
+    }
+
+    /// Set [`Self::fragment_compressed_client_messages`]. This local framing policy
+    /// applies when the client sends a compressed message after negotiating deflate.
+    #[cfg(feature = "deflate")]
+    pub fn fragment_compressed_client_messages(mut self, enabled: bool) -> Self {
+        self.fragment_compressed_client_messages = enabled;
         self
     }
 
@@ -1270,6 +1284,16 @@ impl WebSocketContext {
             Role::Client => {
                 // 5.  If the data is being sent by the client, the frame(s) MUST be
                 // masked as defined in Section 5.3. (RFC 6455)
+                #[cfg(feature = "deflate")]
+                if carries_compression_state
+                    && self.config.fragment_compressed_client_messages
+                    && self
+                        .frame
+                        .queue_client_fragments(&frame)
+                        .inspect_err(|_| self.fail_compression())?
+                {
+                    return self.frame.write_if_ready(stream).check_connection_reset(self.state);
+                }
                 frame.set_random_mask().inspect_err(|_| {
                     #[cfg(feature = "deflate")]
                     if carries_compression_state {

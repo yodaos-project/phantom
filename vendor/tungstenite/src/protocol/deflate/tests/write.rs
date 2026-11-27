@@ -357,3 +357,109 @@ fn a_rejected_client_raw_frame_is_returned_masked() {
         other => panic!("the mask is what pushes this frame past the cap: {other:?}"),
     }
 }
+
+#[test]
+fn compressed_client_messages_use_one_frame_unless_fragmentation_is_enabled() {
+    use crate::protocol::frame::FrameSocket;
+
+    // The random-binary-64k corpus from scripts/capture/http2_websocket.py.
+    let mut state = 0x5048_414e_u32;
+    let payload: Vec<_> = (0..64 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let message = Message::binary(payload);
+    let config = WebSocketConfig::default().enable_deflate();
+    for (client_config, expected_frames) in
+        [(config, 1), (config.fragment_compressed_client_messages(true), 5)]
+    {
+        let mut client =
+            WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(client_config));
+        client.send(message.clone()).unwrap();
+        let wire = &client.get_ref().0;
+        let mut frames = FrameSocket::new(io::Cursor::new(wire));
+        for i in 0..expected_frames {
+            let frame = frames.read(None).unwrap().unwrap();
+            let last = i + 1 == expected_frames;
+            let opcode = if i == 0 { OpData::Binary } else { OpData::Continue };
+            assert_eq!(frame.header().opcode, OpCode::Data(opcode));
+            assert_eq!(frame.header().rsv1, i == 0);
+            assert_eq!(frame.header().is_final, last);
+            assert!(frame.header().mask.is_some());
+            if !last {
+                assert_eq!(frame.payload().len(), 16 * 1024);
+            }
+        }
+        assert!(frames.read(None).unwrap().is_none());
+        let mut peer =
+            WebSocket::from_raw_socket(io::Cursor::new(wire.clone()), Role::Server, Some(config));
+        assert_eq!(peer.read().unwrap(), message);
+    }
+}
+
+#[test]
+fn a_short_last_fragment_fits_at_the_exact_masked_wire_size() {
+    use crate::protocol::deflate::{Context, Settings};
+    use crate::protocol::frame::FrameSocket;
+
+    let payload = noise(16 * 1024, 7);
+    let compressed = Context::new(Role::Client, Settings::default()).compress(&payload).unwrap();
+    let tail = compressed.len() - 16 * 1024;
+    assert!((1..=125).contains(&tail));
+    let exact = compressed.len() + 8 + 6;
+    let message = Message::binary(payload);
+    for (cap, lengths) in [(exact, vec![16 * 1024, tail]), (exact - 1, vec![compressed.len()])] {
+        let config = WebSocketConfig::default()
+            .enable_deflate()
+            .fragment_compressed_client_messages(true)
+            .write_buffer_size(0)
+            .max_write_buffer_size(cap);
+        let mut client = WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
+        client.send(message.clone()).unwrap();
+
+        let wire = &client.get_ref().0;
+        let mut frames = FrameSocket::new(io::Cursor::new(wire));
+        for len in lengths {
+            assert_eq!(frames.read(None).unwrap().unwrap().payload().len(), len);
+        }
+        assert!(frames.read(None).unwrap().is_none());
+        assert!(wire.len() <= cap);
+        let mut peer =
+            WebSocket::from_raw_socket(io::Cursor::new(wire.clone()), Role::Server, Some(config));
+        assert_eq!(peer.read().unwrap(), message);
+    }
+}
+
+#[test]
+fn a_client_can_use_the_admitted_single_frame_at_the_write_limit() {
+    use crate::protocol::deflate::{Context, Settings};
+    use crate::protocol::frame::FrameSocket;
+
+    let payload = noise(40_000, 7);
+    let compressed = Context::new(Role::Client, Settings::default()).compress(&payload).unwrap();
+    let frame = Frame::message(compressed, OpCode::Data(OpData::Binary), true);
+    let cap = wire_size(Role::Client, &frame);
+    let config = WebSocketConfig::default()
+        .write_buffer_size(0)
+        .max_write_buffer_size(cap)
+        .enable_deflate()
+        .fragment_compressed_client_messages(true);
+    let mut client = WebSocket::from_raw_socket(Recorder::default(), Role::Client, Some(config));
+    let message = Message::binary(payload);
+    client.send(message.clone()).unwrap();
+
+    let wire = &client.get_ref().0;
+    assert_eq!(wire.len(), cap);
+    let mut frames = FrameSocket::new(io::Cursor::new(wire));
+    let frame = frames.read(Some(cap)).unwrap().unwrap();
+    assert!(frame.header().rsv1 && frame.header().is_final);
+    assert!(frame.header().mask.is_some());
+    assert!(frames.read(None).unwrap().is_none());
+    let mut peer =
+        WebSocket::from_raw_socket(io::Cursor::new(wire.clone()), Role::Server, Some(config));
+    assert_eq!(peer.read().unwrap(), message);
+}

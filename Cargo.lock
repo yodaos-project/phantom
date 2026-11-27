@@ -1192,6 +1192,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libz-rs-sys"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f03f646627118e75ffb67077e6c263a188ef0c84092e6459f073bf4d0e8def67"
+dependencies = [
+ "zlib-rs",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1788,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-tokio-tungstenite"
-version = "0.30.0-phantom.3"
+version = "0.30.0-phantom.4"
 dependencies = [
  "futures-util",
  "log",
@@ -1798,11 +1807,12 @@ dependencies = [
 
 [[package]]
 name = "phantom-tungstenite"
-version = "0.30.0-phantom.3"
+version = "0.30.0-phantom.4"
 dependencies = [
  "bytes",
  "flate2",
  "http",
+ "libz-rs-sys",
  "log",
  "rand",
  "thiserror 2.0.20",
@@ -3095,9 +3105,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.8"
+version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+checksum = "aa76918995d776d9dd34d371030be228d021137449771493d56e29f77e4148ac"
 
 [[package]]
 name = "zmij"

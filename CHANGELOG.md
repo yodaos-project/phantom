@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Allow WebSocket clients to opt into masked 16 KiB fragments for large compressed
+  messages. The default still sends each message in one frame. Accept
+  RFC 7692 final DEFLATE blocks with context takeover and reject truncated
+  compressed messages before delivery.
+
 - Add a scheduled `capture-drift` workflow that snapshots the macOS runner's current
   Chrome wire fingerprint weekly and, when it no longer matches a retained fixture
   (a new version or a changed ClientHello), opens a draft PR with the refreshed
