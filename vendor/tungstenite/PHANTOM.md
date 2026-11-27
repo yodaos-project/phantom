@@ -12,7 +12,7 @@ unrecorded edit to the vendored crate.
 
 `publish-identity.patch` is always the last entry in `patches/series`. It
 renames the package (`tungstenite` becomes `phantom-tungstenite` at
-`0.30.0-phantom.4`), keeps the upstream library name so source, tests, and
+`0.30.0-phantom.5`), keeps the upstream library name so source, tests, and
 examples are unchanged, and points the repository metadata at Phantom. It
 removes the upstream documentation link, keeps Cargo's reserved archive files
 out of the packaged crate, and records the upstream package, version, and
@@ -75,6 +75,10 @@ slices exclusively for the duration of inflation and clear their pointers
 before returning. Moving the decoder transfers exclusive ownership. Shared
 access exposes no stream operation. The outer codec enforces the cumulative
 inflated message limit across continuation frames.
+
+`deflate-sync-flush.patch` feeds the message and requests a sync flush in the same call.
+Short messages start with a payload-sized buffer and larger messages grow the buffer until
+zlib has consumed all input and returned with spare output space.
 
 ## Required check
 

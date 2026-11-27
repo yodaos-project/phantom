@@ -62,6 +62,24 @@ fn decode_all(wire: &[u8]) -> Vec<Message> {
     }
 }
 
+#[test]
+fn sync_flush_completes_across_output_buffer_boundaries() {
+    let config = WebSocketConfig::default().enable_deflate();
+    let mut socket = WebSocket::from_raw_socket(Recorder::default(), Role::Server, Some(config));
+    // With an empty dictionary, 4086 random bytes fill the first 4096-byte
+    // buffer with a stored block and its sync marker. Exercise adjacent sizes,
+    // multiple growths, and a following message that can reuse the dictionary.
+    let mut expected = Vec::new();
+    for (seed, len) in [4086, 4085, 4087, 1, 640, 65536].into_iter().enumerate() {
+        let message = Message::binary(noise(len, seed as u8));
+        for _ in 0..2 {
+            socket.send(message.clone()).unwrap();
+            expected.push(message.clone());
+        }
+    }
+    assert_eq!(decode_all(&socket.into_inner().0), expected);
+}
+
 fn reject_one(first: &[u8], second: &[u8]) -> (WebSocket<Recorder>, Frame) {
     let mut socket = server();
     socket

@@ -6,4 +6,5 @@ deprecated-max-value.patch
 deflate-http-whitespace-tests.patch
 deflate-http-whitespace.patch
 rfc7692-client-fragments.patch
+deflate-sync-flush.patch
 publish-identity.patch

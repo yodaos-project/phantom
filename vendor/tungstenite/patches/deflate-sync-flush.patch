@@ -1,0 +1,78 @@
+diff --git a/src/protocol/deflate/codec.rs b/src/protocol/deflate/codec.rs
+index 7d6d27e..e771ccc 100644
+--- a/src/protocol/deflate/codec.rs
++++ b/src/protocol/deflate/codec.rs
+@@ -51,32 +51,28 @@ impl Context {
+         if input.is_empty() {
+             return Ok(Bytes::from_static(&[0]));
+         }
+-        let mut output = Vec::new();
+-        while !input.is_empty() {
+-            output.reserve(CHUNK);
++        // Most messages fit in one call. Leave room for the stored-block header
++        // and sync marker, and grow as needed for larger or expanding payloads.
++        let mut output = Vec::with_capacity(input.len().saturating_add(32).min(CHUNK));
++        loop {
++            let available = (output.capacity() - output.len()).min(u32::MAX as usize);
+             let before = (self.encoder.total_in(), self.encoder.total_out());
+             let status = self
+                 .encoder
+-                .compress_vec(input, &mut output, FlushCompress::None)
++                .compress_vec(input, &mut output, FlushCompress::Sync)
+                 .map_err(|_| ProtocolError::Compression)?;
+             let consumed = (self.encoder.total_in() - before.0) as usize;
+             let produced = (self.encoder.total_out() - before.1) as usize;
+             input = &input[consumed..];
+-            if !progress(status, consumed, produced)? {
++            // zlib completes Z_SYNC_FLUSH when all input is consumed and there
++            // is output space left. A full buffer can still have a pending marker.
++            if input.is_empty() && produced < available {
+                 break;
+             }
+-        }
+-        loop {
+-            output.reserve(CHUNK);
+-            let before = self.encoder.total_out();
+-            let status = self
+-                .encoder
+-                .compress_vec(&[], &mut output, FlushCompress::Sync)
+-                .map_err(|_| ProtocolError::Compression)?;
+-            let produced = (self.encoder.total_out() - before) as usize;
+-            if !progress(status, 0, produced)? {
+-                break;
++            if !progress(status, consumed, produced)? {
++                return Err(ProtocolError::Compression.into());
+             }
++            output.reserve(CHUNK);
+         }
+         if !output.ends_with(TRAILER) {
+             self.encoder.reset();
+diff --git a/src/protocol/deflate/tests/write.rs b/src/protocol/deflate/tests/write.rs
+index be344bf..0259d9d 100644
+--- a/src/protocol/deflate/tests/write.rs
++++ b/src/protocol/deflate/tests/write.rs
+@@ -62,6 +62,24 @@ fn decode_all(wire: &[u8]) -> Vec<Message> {
+     }
+ }
+ 
++#[test]
++fn sync_flush_completes_across_output_buffer_boundaries() {
++    let config = WebSocketConfig::default().enable_deflate();
++    let mut socket = WebSocket::from_raw_socket(Recorder::default(), Role::Server, Some(config));
++    // With an empty dictionary, 4086 random bytes fill the first 4096-byte
++    // buffer with a stored block and its sync marker. Exercise adjacent sizes,
++    // multiple growths, and a following message that can reuse the dictionary.
++    let mut expected = Vec::new();
++    for (seed, len) in [4086, 4085, 4087, 1, 640, 65536].into_iter().enumerate() {
++        let message = Message::binary(noise(len, seed as u8));
++        for _ in 0..2 {
++            socket.send(message.clone()).unwrap();
++            expected.push(message.clone());
++        }
++    }
++    assert_eq!(decode_all(&socket.into_inner().0), expected);
++}
++
+ fn reject_one(first: &[u8], second: &[u8]) -> (WebSocket<Recorder>, Frame) {
+     let mut socket = server();
+     socket

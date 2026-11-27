@@ -51,32 +51,28 @@ impl Context {
         if input.is_empty() {
             return Ok(Bytes::from_static(&[0]));
         }
-        let mut output = Vec::new();
-        while !input.is_empty() {
-            output.reserve(CHUNK);
+        // Most messages fit in one call. Leave room for the stored-block header
+        // and sync marker, and grow as needed for larger or expanding payloads.
+        let mut output = Vec::with_capacity(input.len().saturating_add(32).min(CHUNK));
+        loop {
+            let available = (output.capacity() - output.len()).min(u32::MAX as usize);
             let before = (self.encoder.total_in(), self.encoder.total_out());
             let status = self
                 .encoder
-                .compress_vec(input, &mut output, FlushCompress::None)
+                .compress_vec(input, &mut output, FlushCompress::Sync)
                 .map_err(|_| ProtocolError::Compression)?;
             let consumed = (self.encoder.total_in() - before.0) as usize;
             let produced = (self.encoder.total_out() - before.1) as usize;
             input = &input[consumed..];
+            // zlib completes Z_SYNC_FLUSH when all input is consumed and there
+            // is output space left. A full buffer can still have a pending marker.
+            if input.is_empty() && produced < available {
+                break;
+            }
             if !progress(status, consumed, produced)? {
-                break;
+                return Err(ProtocolError::Compression.into());
             }
-        }
-        loop {
             output.reserve(CHUNK);
-            let before = self.encoder.total_out();
-            let status = self
-                .encoder
-                .compress_vec(&[], &mut output, FlushCompress::Sync)
-                .map_err(|_| ProtocolError::Compression)?;
-            let produced = (self.encoder.total_out() - before) as usize;
-            if !progress(status, 0, produced)? {
-                break;
-            }
         }
         if !output.ends_with(TRAILER) {
             self.encoder.reset();
