@@ -1797,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-tokio-tungstenite"
-version = "0.30.0-phantom.4"
+version = "0.30.0-phantom.5"
 dependencies = [
  "futures-util",
  "log",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "phantom-tungstenite"
-version = "0.30.0-phantom.4"
+version = "0.30.0-phantom.5"
 dependencies = [
  "bytes",
  "flate2",

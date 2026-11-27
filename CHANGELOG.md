@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Reduce CPU and allocation overhead when sending short compressed WebSocket messages.
+
 - Allow WebSocket clients to opt into masked 16 KiB fragments for large compressed
   messages. The default still sends each message in one frame. Accept
   RFC 7692 final DEFLATE blocks with context takeover and reject truncated

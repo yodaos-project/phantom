@@ -9,7 +9,7 @@ index 7a0464f..925c6bf 100644
 -name = "tungstenite"
 -version = "0.30.0"
 +name = "phantom-tungstenite"
-+version = "0.30.0-phantom.4"
++version = "0.30.0-phantom.5"
  authors = [
      "Alexey Galakhov",
      "Daniel Abramov",
